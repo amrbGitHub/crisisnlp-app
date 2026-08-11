@@ -4,5 +4,3 @@ transformers
 huggingface-hub
 lime
 scikit-learn
-pandas
-numpy<2
