@@ -1,0 +1,13 @@
+# CrisisNLP - Streamlit Cloud deployment
+# CPU-only torch wheel: Streamlit Cloud has no GPU, and the default wheel
+# pulls ~2 GB of CUDA libraries that blow past the build limit.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+streamlit==1.40.2
+torch==2.5.1
+transformers==4.46.3
+huggingface-hub==0.26.5
+lime==0.2.0.1
+scikit-learn==1.5.2
+pandas==2.2.3
+numpy==1.26.4
