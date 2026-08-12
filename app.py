@@ -10,6 +10,7 @@ This is a research prototype, not a diagnostic instrument. See the standing
 notice in the sidebar.
 """
 
+import gc
 import json
 import os
 import time
@@ -74,24 +75,31 @@ def load_model(repo_id: str, quantize: bool = True):
         except ImportError:
             from torch.quantization import quantize_dynamic
         try:
-            model = quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+            import gc
+            quantized = quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+            del model
+            gc.collect()
+            model = quantized
+            cfg["_quantized"] = True
         except Exception as exc:
-            st.sidebar.caption(f"Quantization unavailable on this runtime ({type(exc).__name__}); running in FP32.")
+            cfg["_quantized"] = False
+            cfg["_quant_error"] = f"{type(exc).__name__}: {exc}"
     return tokenizer, model, cfg
 
 
 @torch.no_grad()
-def predict_proba(texts, tokenizer, model, batch_size: int = 8) -> np.ndarray:
+def predict_proba(texts, tokenizer, model, batch_size: int = 4) -> np.ndarray:
     out = []
     for i in range(0, len(texts), batch_size):
         batch = tokenizer(
             list(texts[i : i + batch_size]),
             truncation=True,
-            padding="max_length",
+            padding="longest",     # pad to the longest post in the batch, not to MAX_LEN
             max_length=MAX_LEN,
             return_tensors="pt",
         )
         out.append(torch.softmax(model(**batch).logits, dim=-1).numpy())
+        del batch
     return np.vstack(out)
 
 
@@ -150,7 +158,7 @@ with st.sidebar:
     with st.expander("Run a benchmark"):
         st.caption("Scores the same post repeatedly and reports the median, "
                    "which is more stable than a single measurement on shared CPU.")
-        n_runs = st.number_input("Runs", 3, 20, 10, 1)
+        n_runs = st.number_input("Runs", 3, 15, 7, 1)
         if st.button("Run benchmark"):
             sample = ("i have been feeling completely overwhelmed lately and i do not know "
                       "who to talk to about any of it anymore")
@@ -160,6 +168,7 @@ with st.sidebar:
                 t = time.perf_counter()
                 predict_proba([sample], tokenizer, model)
                 times.append((time.perf_counter() - t) * 1000.0)
+                gc.collect()
                 bar.progress((i + 1) / float(n_runs))
             warm = times[1:] if len(times) > 1 else times
             st.session_state["bench"] = {
@@ -188,6 +197,12 @@ except Exception as exc:
         f"repo is private, add an `HF_TOKEN` under Streamlit secrets.\n\n```\n{exc}\n```"
     )
     st.stop()
+
+if quantize and cfg.get("_quantized") is False:
+    st.warning(
+        "INT8 quantization did not apply on this runtime, so the model is running in FP32 "
+        f"and using roughly twice the memory. Cause: {cfg.get('_quant_error', 'unknown')}"
+    )
 
 tuned_bias = cfg.get("high_risk_logit_bias")
 if tuned_bias is not None and abs(bias - tuned_bias) > 0.01:
@@ -295,7 +310,7 @@ with tab_batch:
         if col is None:
             st.error("No `text` or `text_clean` column found in that file.")
         else:
-            n = min(len(df), 200)
+            n = min(len(df), 50)
             if len(df) > n:
                 st.caption(f"Screening the first {n} of {len(df)} rows to keep this responsive.")
             df = df.head(n).copy()
