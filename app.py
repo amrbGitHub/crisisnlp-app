@@ -68,7 +68,15 @@ def load_model(repo_id: str, quantize: bool = True):
         pass
 
     if quantize:
-        model = torch.quantization.quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+        # The quantization entry point moved between torch versions; try both.
+        try:
+            from torch.ao.quantization import quantize_dynamic
+        except ImportError:
+            from torch.quantization import quantize_dynamic
+        try:
+            model = quantize_dynamic(model, {torch.nn.Linear}, dtype=torch.qint8)
+        except Exception as exc:
+            st.sidebar.caption(f"Quantization unavailable on this runtime ({type(exc).__name__}); running in FP32.")
     return tokenizer, model, cfg
 
 
@@ -125,6 +133,47 @@ with st.sidebar:
     show_lime = st.checkbox("Explain the prediction", value=True,
                             help="Adds roughly 20-40 seconds per post on CPU.")
 
+    st.divider()
+    st.subheader("Latency")
+    lat = st.session_state.get("latencies", [])
+    if lat:
+        warm = lat[1:] if len(lat) > 1 else lat   # discard the cold first call
+        med = float(np.median(warm))
+        st.metric("Median inference", f"{med:.0f} ms",
+                  help="Model forward pass only, excluding page rendering and LIME.")
+        st.caption(f"{len(warm)} warm run(s). Phase 1 target: under 300 ms.")
+        if st.button("Reset timings"):
+            st.session_state["latencies"] = []
+    else:
+        st.caption("Screen a post to start measuring.")
+
+    with st.expander("Run a benchmark"):
+        st.caption("Scores the same post repeatedly and reports the median, "
+                   "which is more stable than a single measurement on shared CPU.")
+        n_runs = st.number_input("Runs", 3, 20, 10, 1)
+        if st.button("Run benchmark"):
+            sample = ("i have been feeling completely overwhelmed lately and i do not know "
+                      "who to talk to about any of it anymore")
+            times = []
+            bar = st.progress(0.0)
+            for i in range(int(n_runs)):
+                t = time.perf_counter()
+                predict_proba([sample], tokenizer, model)
+                times.append((time.perf_counter() - t) * 1000.0)
+                bar.progress((i + 1) / float(n_runs))
+            warm = times[1:] if len(times) > 1 else times
+            st.session_state["bench"] = {
+                "n": len(warm), "median": float(np.median(warm)),
+                "min": float(np.min(warm)), "max": float(np.max(warm)),
+            }
+        b = st.session_state.get("bench")
+        if b:
+            st.write(
+                f"**Median {b['median']:.0f} ms** across {b['n']} warm runs "
+                f"(range {b['min']:.0f} to {b['max']:.0f} ms)."
+            )
+            st.caption("Free-tier CPU allocation varies, so report the median, not a single run.")
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -160,20 +209,21 @@ with tab_single:
     go = st.button("Screen this post", type="primary")
 
     if go and text.strip():
-        t0 = time.time()
+        t0 = time.perf_counter()
         probs = predict_proba([text], tokenizer, model)
+        infer_ms = (time.perf_counter() - t0) * 1000.0
         if bias:
             probs = apply_bias(probs, bias)
         p = probs[0]
         band = int(p.argmax())
-        elapsed = time.time() - t0
+        st.session_state.setdefault("latencies", []).append(infer_ms)
 
         left, right = st.columns([3, 2])
         with left:
             st.markdown(
                 f"<div class='band-card' style='background:{BAND_COLOR[band]}'>"
                 f"<h2>{LABELS[band]}</h2>"
-                f"<p>Confidence {p[band]:.0%} &nbsp;·&nbsp; scored in {elapsed:.1f}s</p></div>",
+                f"<p>Confidence {p[band]:.0%} &nbsp;·&nbsp; inference {infer_ms:.0f} ms</p></div>",
                 unsafe_allow_html=True,
             )
             if band == HIGH_RISK:
